@@ -28,5 +28,5 @@ function displayProducts(products) {
     `).join('');
 }
 
-// Load products on page load
+// Load products on page loadjjjjjjjjjjjjjjjjjj
 document.addEventListener('DOMContentLoaded', loadProducts);
