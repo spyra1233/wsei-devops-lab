@@ -10,7 +10,11 @@
 /lab3/infra/vmss*
 /lab3/infra/deploy.ps1
 
+/.github/agents/*
+
 **/**wyklad.md
+
+/lab6/scripts*
 
 # Node.js
 node_modules/

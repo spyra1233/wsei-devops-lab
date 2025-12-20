@@ -1,0 +1,177 @@
+name: Student CI/CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy (1 or 2)'
+        required: true
+        type: choice
+        options:
+          - '1'
+          - '2'
+      student-name:
+        description: 'Your name (lowercase, no spaces)'
+        required: true
+        type: string
+
+env:
+  LOCATION: francecentral
+  IMAGE_NAME: productapi
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set environment variables
+        run: |
+          STUDENT="${{ inputs.student-name }}"
+          echo "RESOURCE_GROUP=rg-$STUDENT-lab6" >> $GITHUB_ENV
+          echo "ACR_NAME=acr${STUDENT}lab6" >> $GITHUB_ENV
+          echo "ACA_ENV=aca-env-$STUDENT" >> $GITHUB_ENV
+          echo "APP_NAME=productapi-$STUDENT" >> $GITHUB_ENV
+      
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Create Resource Group
+        run: |
+          az group create \
+            --name ${{ env.RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }} \
+            --output none || echo "Resource group already exists"
+      
+      - name: Create Azure Container Registry
+        run: |
+          az acr show --name ${{ env.ACR_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} 2>/dev/null || \
+          az acr create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.ACR_NAME }} \
+            --sku Basic \
+            --admin-enabled true \
+            --output none
+      
+      - name: Get ACR credentials
+        id: acr-creds
+        run: |
+          ACR_USERNAME=$(az acr credential show --name ${{ env.ACR_NAME }} --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name ${{ env.ACR_NAME }} --query "passwords[0].value" -o tsv)
+          echo "username=$ACR_USERNAME" >> $GITHUB_OUTPUT
+          echo "::add-mask::$ACR_PASSWORD"
+          echo "password=$ACR_PASSWORD" >> $GITHUB_OUTPUT
+          echo "login-server=${{ env.ACR_NAME }}.azurecr.io" >> $GITHUB_OUTPUT
+      
+      - name: Build and push Docker image
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+          
+          docker build -t ${{ steps.acr-creds.outputs.login-server }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}.0 lab6/app
+          docker push ${{ steps.acr-creds.outputs.login-server }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}.0
+      
+      - name: Create Container Apps Environment
+        run: |
+          az containerapp env show --name ${{ env.ACA_ENV }} --resource-group ${{ env.RESOURCE_GROUP }} 2>/dev/null || \
+          az containerapp env create \
+            --name ${{ env.ACA_ENV }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }} \
+            --logs-destination none \
+            --output none
+      
+      - name: Deploy Container App
+        id: deploy
+        run: |
+          IMAGE="${{ steps.acr-creds.outputs.login-server }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}.0"
+          
+          # Check if app exists
+          if az containerapp show --name ${{ env.APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} 2>/dev/null; then
+            echo "Updating existing app with new revision..."
+            
+            az containerapp update \
+              --name ${{ env.APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image $IMAGE \
+              --output none
+            
+            # Get revisions for canary
+            REVISIONS=$(az containerapp revision list \
+              --name ${{ env.APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "[?properties.active].name" \
+              -o tsv)
+            
+            REVISION_COUNT=$(echo "$REVISIONS" | wc -l)
+            
+            if [ $REVISION_COUNT -ge 2 ]; then
+              LATEST=$(echo "$REVISIONS" | head -n 1)
+              PREVIOUS=$(echo "$REVISIONS" | head -n 2 | tail -n 1)
+              
+              echo "Setting canary: 20% → new, 80% → previous"
+              az containerapp ingress traffic set \
+                --name ${{ env.APP_NAME }} \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --revision-weight "$LATEST=20" "$PREVIOUS=80" \
+                --output none
+              
+              echo "canary=true" >> $GITHUB_OUTPUT
+            else
+              echo "canary=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Creating new app..."
+            
+            az containerapp create \
+              --name ${{ env.APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --environment ${{ env.ACA_ENV }} \
+              --image $IMAGE \
+              --registry-server ${{ steps.acr-creds.outputs.login-server }} \
+              --registry-username ${{ steps.acr-creds.outputs.username }} \
+              --registry-password ${{ steps.acr-creds.outputs.password }} \
+              --target-port 8080 \
+              --ingress external \
+              --min-replicas 1 \
+              --max-replicas 3 \
+              --output none
+            
+            echo "canary=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Get Application URL
+        id: get-url
+        run: |
+          URL=$(az containerapp show \
+            --name ${{ env.APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)
+          echo "url=https://$URL" >> $GITHUB_OUTPUT
+      
+      - name: Display summary
+        run: |
+          echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Student:** ${{ inputs.student-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v${{ inputs.version }}.0" >> $GITHUB_STEP_SUMMARY
+          echo "**Application URL:** ${{ steps.get-url.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.deploy.outputs.canary }}" == "true" ]; then
+            echo "**Traffic Split:** 20% new version, 80% previous version" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Traffic Split:** 100% (single revision)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test your application:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "curl ${{ steps.get-url.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "curl ${{ steps.get-url.outputs.url }}/health" >> $GITHUB_STEP_SUMMARY
+          echo "curl ${{ steps.get-url.outputs.url }}/api/products" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
